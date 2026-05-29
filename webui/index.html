@@ -202,7 +202,7 @@ $('#clear').onclick = () => {
 // VAD tuning (talk-to-talk). RMS is over Float32 samples in [-1, 1].
 const VAD_START = 0.02;     // energy to trigger speech onset
 const VAD_CONT  = 0.012;    // energy that keeps the utterance alive
-const VAD_SILENCE = 700;    // ms of silence that ends an utterance
+const VAD_SILENCE = 1500;    // ms of silence that ends an utterance
 const VAD_MIN_MS = 350;     // ignore blips shorter than this
 
 const micBtn = $('#mic'), micModeSel = $('#micMode');
