@@ -36,6 +36,14 @@
   }
   #send { background: #2563eb; color: #fff; border: none; border-radius: 10px; padding: 0 20px; cursor: pointer; }
   #send:disabled { background: #374151; cursor: default; }
+  #mic {
+    background: #222732; border: 1px solid #333a47; border-radius: 10px;
+    padding: 0 14px; font-size: 20px; cursor: pointer; user-select: none;
+    -webkit-user-select: none; touch-action: none;
+  }
+  #mic.recording { background: #dc2626; border-color: #dc2626; }
+  #mic.listening { background: #16a34a; border-color: #16a34a; }
+  #mic.busy { opacity: 0.6; }
   .spk { font-size: 12px; color: #6b7280; margin-left: 6px; }
 </style>
 </head>
@@ -48,10 +56,15 @@
       <input type="range" id="pause" min="0" max="2000" step="50" value="500" style="width:90px;accent-color:#2563eb">
       <span id="pauseVal">500ms</span>
     </label>
+    <select id="micMode" title="Microphone mode">
+      <option value="ptt">Push to talk</option>
+      <option value="vad">Talk to talk</option>
+    </select>
     <button id="clear" style="margin-left:auto;background:#222732;color:#e6e6e6;border:1px solid #333a47;border-radius:8px;padding:6px 12px;cursor:pointer">clear</button>
   </header>
   <div id="log"></div>
   <footer>
+    <button id="mic" title="Microphone">🎤</button>
     <textarea id="input" rows="1" placeholder="Type a message and press Enter…"></textarea>
     <button id="send">Send</button>
   </footer>
@@ -111,11 +124,13 @@ function addMsg(cls, text='') {
 }
 
 let controller = null;        // AbortController for the in-flight request
+let requestInFlight = false;  // true while a /chat request is streaming
 
-async function send() {
-  const text = input.value.trim();
+async function send(textArg) {
+  const fromInput = textArg === undefined;
+  const text = (fromInput ? input.value : textArg).trim();
   if (!text) return;
-  input.value = '';
+  if (fromInput) input.value = '';
 
   // Interrupt anything in flight: cancel its fetch and stop its audio.
   if (controller) controller.abort();
@@ -128,6 +143,7 @@ async function send() {
 
   const botDiv = addMsg('bot speaking');
   let full = '';
+  requestInFlight = true;
 
   try {
     const resp = await fetch('/chat', {
@@ -167,12 +183,12 @@ async function send() {
       botDiv.textContent = full + '\n[error: ' + e.message + ']';
     }
   } finally {
+    requestInFlight = false;
     botDiv.classList.remove('speaking');
-    input.focus();
   }
 }
 
-sendBtn.onclick = send;
+sendBtn.onclick = () => send();
 input.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
@@ -181,6 +197,171 @@ $('#clear').onclick = () => {
   stopPlayback();
   history = []; log.innerHTML = '';
 };
+
+// ===== Speech-to-text (microphone) =====================================
+// VAD tuning (talk-to-talk). RMS is over Float32 samples in [-1, 1].
+const VAD_START = 0.02;     // energy to trigger speech onset
+const VAD_CONT  = 0.012;    // energy that keeps the utterance alive
+const VAD_SILENCE = 700;    // ms of silence that ends an utterance
+const VAD_MIN_MS = 350;     // ignore blips shorter than this
+
+const micBtn = $('#mic'), micModeSel = $('#micMode');
+const micMode = () => micModeSel.value;
+
+let audioCtx = null, micStream = null, procNode = null, srcNode = null;
+let capturing = false, captureKind = null, transcribing = false;
+let pttChunks = [], pttHeld = false;
+let vadInSpeech = false, vadBuf = [], vadLastVoice = 0, vadStart = 0;
+
+function downsample(data, inRate, outRate) {
+  if (outRate >= inRate) return data;
+  const ratio = inRate / outRate;
+  const outLen = Math.floor(data.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const start = Math.floor(i * ratio), end = Math.floor((i + 1) * ratio);
+    let sum = 0, c = 0;
+    for (let j = start; j < end && j < data.length; j++) { sum += data[j]; c++; }
+    out[i] = c ? sum / c : 0;
+  }
+  return out;
+}
+
+function encodeWAV(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const ws = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); ws(8, 'WAVE');
+  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function chunksToWav(chunks, rate) {
+  let len = 0; chunks.forEach(c => len += c.length);
+  const all = new Float32Array(len);
+  let o = 0; chunks.forEach(c => { all.set(c, o); o += c.length; });
+  return encodeWAV(downsample(all, rate, 16000), 16000);
+}
+
+async function transcribeAndSend(wavBlob) {
+  transcribing = true;
+  micBtn.classList.add('busy');
+  try {
+    const r = await fetch('/transcribe', { method: 'POST', body: wavBlob });
+    const j = await r.json();
+    const text = (j.text || '').trim();
+    if (text) send(text);
+  } catch (e) {
+    console.error('transcribe failed', e);
+  } finally {
+    transcribing = false;
+    micBtn.classList.remove('busy');
+  }
+}
+
+function onAudio(e) {
+  const inBuf = e.inputBuffer.getChannelData(0);
+  if (captureKind === 'ptt') { pttChunks.push(new Float32Array(inBuf)); return; }
+
+  // talk-to-talk: don't listen while the assistant speaks / is generating
+  // (avoids the mic transcribing the TTS output) or while transcribing.
+  if (playing || requestInFlight || transcribing) { vadInSpeech = false; vadBuf = []; return; }
+
+  let sum = 0;
+  for (let i = 0; i < inBuf.length; i++) sum += inBuf[i] * inBuf[i];
+  const rms = Math.sqrt(sum / inBuf.length);
+  const now = performance.now();
+
+  if (rms > VAD_START) {
+    if (!vadInSpeech) { vadInSpeech = true; vadBuf = []; vadStart = now; }
+    vadLastVoice = now;
+  }
+  if (vadInSpeech) {
+    vadBuf.push(new Float32Array(inBuf));
+    if (rms > VAD_CONT) vadLastVoice = now;
+    if (now - vadLastVoice > VAD_SILENCE) {
+      const speechMs = vadLastVoice - vadStart;
+      const segment = vadBuf;
+      vadInSpeech = false; vadBuf = [];
+      if (speechMs >= VAD_MIN_MS) transcribeAndSend(chunksToWav(segment, audioCtx.sampleRate));
+    }
+  }
+}
+
+async function startCapture(kind) {
+  if (capturing) return;
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  srcNode = audioCtx.createMediaStreamSource(micStream);
+  procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  captureKind = kind; capturing = true;
+  pttChunks = []; vadInSpeech = false; vadBuf = [];
+  procNode.onaudioprocess = onAudio;
+  srcNode.connect(procNode);
+  procNode.connect(audioCtx.destination);   // keep the node pumping
+}
+
+function stopCapture() {
+  if (!capturing) return;
+  capturing = false; captureKind = null;
+  try { procNode.disconnect(); srcNode.disconnect(); } catch (_) {}
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  audioCtx = micStream = procNode = srcNode = null;
+}
+
+function finishPTT() {
+  if (!capturing) { micBtn.classList.remove('recording'); return; }
+  const rate = audioCtx.sampleRate;
+  const chunks = pttChunks;
+  stopCapture();
+  micBtn.classList.remove('recording');
+  if (chunks.length) transcribeAndSend(chunksToWav(chunks, rate));
+}
+
+// Push-to-talk: hold the mic button.
+micBtn.addEventListener('pointerdown', async e => {
+  if (micMode() !== 'ptt') return;
+  e.preventDefault();
+  try { micBtn.setPointerCapture(e.pointerId); } catch (_) {}
+  pttHeld = true;
+  micBtn.classList.add('recording');
+  try { await startCapture('ptt'); }
+  catch (err) { pttHeld = false; micBtn.classList.remove('recording'); alert('Mic error: ' + err.message); return; }
+  if (!pttHeld) finishPTT();   // released before init finished
+});
+function endPTT() {
+  if (micMode() !== 'ptt' || !pttHeld) return;
+  pttHeld = false;
+  finishPTT();
+}
+micBtn.addEventListener('pointerup', endPTT);
+micBtn.addEventListener('pointercancel', endPTT);
+
+// Talk-to-talk: click toggles continuous listening.
+micBtn.addEventListener('click', async e => {
+  if (micMode() !== 'vad') return;
+  if (capturing) { stopCapture(); micBtn.classList.remove('listening'); return; }
+  try { await startCapture('vad'); micBtn.classList.add('listening'); }
+  catch (err) { alert('Mic error: ' + err.message); }
+});
+
+micModeSel.onchange = () => {
+  if (capturing) stopCapture();
+  pttHeld = false;
+  micBtn.classList.remove('recording', 'listening', 'busy');
+};
+
 loadVoices();
 input.focus();
 </script>

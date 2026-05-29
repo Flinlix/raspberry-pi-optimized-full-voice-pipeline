@@ -14,6 +14,7 @@ import base64
 import io
 import json
 import re
+import ssl
 import threading
 import urllib.request
 import wave
@@ -26,8 +27,12 @@ from piper import PiperVoice
 HOST = "0.0.0.0"
 PORT = 5000
 LLAMA_URL = "http://127.0.0.1:8080/v1/chat/completions"
+WHISPER_URL = "http://127.0.0.1:8081/inference"
+WHISPER_LANGUAGE = "auto"  # 'auto' to detect, or e.g. 'de' / 'en'
 VOICES_DIR = Path(__file__).resolve().parent.parent / "piper" / "voices"
 WEB_DIR = Path(__file__).resolve().parent
+CERT_DIR = WEB_DIR / "certs"  # if cert.pem + key.pem exist here, serve HTTPS
+                              # (browsers only allow mic on HTTPS / localhost)
 # Flush the first sentence early (low latency); let later ones grow a bit
 # longer for more natural prosody (quality).
 FIRST_FLUSH_MIN = 12
@@ -126,6 +131,32 @@ def stream_llama(messages: list[dict]):
                 yield delta
 
 
+def transcribe_wav(wav_bytes: bytes) -> str:
+    """Forward WAV audio to whisper-server's /inference and return the text."""
+    boundary = "----webuiboundary"
+    parts = []
+    for field, value in (("response_format", "json"), ("language", WHISPER_LANGUAGE)):
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
+        parts.append(f"{value}\r\n".encode())
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n')
+    parts.append(b"Content-Type: audio/wav\r\n\r\n")
+    parts.append(wav_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        WHISPER_URL, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        obj = json.loads(resp.read().decode("utf-8"))
+    return obj.get("text", "").strip()
+
+
 def sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
@@ -152,7 +183,19 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b'{"error":"not found"}')
 
+    def handle_transcribe(self):
+        length = int(self.headers.get("Content-Length", 0))
+        wav_bytes = self.rfile.read(length)
+        try:
+            text = transcribe_wav(wav_bytes)
+            self._send(200, json.dumps({"text": text}).encode())
+        except Exception as e:
+            self._send(502, json.dumps({"error": str(e)}).encode())
+
     def do_POST(self):
+        if self.path == "/transcribe":
+            self.handle_transcribe()
+            return
         if self.path != "/chat":
             self._send(404, b'{"error":"not found"}')
             return
@@ -216,9 +259,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+
+    cert, key = CERT_DIR / "cert.pem", CERT_DIR / "key.pem"
+    scheme = "http"
+    if cert.exists() and key.exists():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+
     print(f"Voices: {', '.join(list_voices())}")
-    print(f"Serving on http://{HOST}:{PORT}  (llama-server expected at {LLAMA_URL})")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    print(f"Serving on {scheme}://{HOST}:{PORT}  (llama-server expected at {LLAMA_URL})")
+    httpd.serve_forever()
 
 
 if __name__ == "__main__":

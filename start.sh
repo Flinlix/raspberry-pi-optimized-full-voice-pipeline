@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 ./stop.sh > /dev/null 2>&1 || true
 # Belt-and-suspenders: clear stragglers not tracked by a pid file.
 pkill -f "llama.cpp/build/bin/llama-server" 2>/dev/null || true
+pkill -f "whisper.cpp/build/bin/whisper-server" 2>/dev/null || true
 pkill -f "webui/app.py" 2>/dev/null || true
 sleep 1
 
@@ -17,6 +18,13 @@ echo "Starting llama-server..."
   > /tmp/llama.log 2>&1 &
 echo $! > /tmp/llama.pid
 
+echo "Starting whisper-server..."
+./whisper/whisper.cpp/build/bin/whisper-server \
+  --model whisper/whisper.cpp/models/ggml-base.bin \
+  --host 127.0.0.1 --port 8081 --language auto --threads 4 \
+  > /tmp/whisper.log 2>&1 &
+echo $! > /tmp/whisper.pid
+
 echo "Waiting for llama-server..."
 until curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; do
   if ! kill -0 "$(cat /tmp/llama.pid)" 2>/dev/null; then
@@ -26,12 +34,24 @@ until curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; do
 done
 echo "llama-server ready."
 
+echo "Waiting for whisper-server..."
+until curl -sf http://127.0.0.1:8081/ > /dev/null 2>&1; do
+  if ! kill -0 "$(cat /tmp/whisper.pid)" 2>/dev/null; then
+    echo "ERROR: whisper-server died on startup. Last log lines:"; tail -n 15 /tmp/whisper.log; exit 1
+  fi
+  sleep 1
+done
+echo "whisper-server ready."
+
 echo "Starting web UI..."
 ./piper/venv/bin/python webui/app.py > /tmp/webui.log 2>&1 &
 echo $! > /tmp/webui.pid
 
+# HTTPS if a cert is present (needed for microphone access from other devices).
+if [ -f webui/certs/cert.pem ]; then SCHEME=https; else SCHEME=http; fi
+
 echo "Waiting for web UI..."
-until curl -sf http://127.0.0.1:5000/voices > /dev/null 2>&1; do
+until curl -skf ${SCHEME}://127.0.0.1:5000/voices > /dev/null 2>&1; do
   if ! kill -0 "$(cat /tmp/webui.pid)" 2>/dev/null; then
     echo "ERROR: web UI died on startup. Last log lines:"; tail -n 15 /tmp/webui.log; exit 1
   fi
@@ -39,4 +59,4 @@ until curl -sf http://127.0.0.1:5000/voices > /dev/null 2>&1; do
 done
 
 IP=$(hostname -I | awk '{print $1}')
-echo "Ready at http://${IP:-localhost}:5000"
+echo "Ready at ${SCHEME}://${IP:-localhost}:5000"
