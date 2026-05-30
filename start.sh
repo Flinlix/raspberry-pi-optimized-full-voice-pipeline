@@ -21,7 +21,7 @@ echo $! > /tmp/llama.pid
 echo "Starting whisper-server..."
 ./whisper/whisper.cpp/build/bin/whisper-server \
   --model whisper/whisper.cpp/models/ggml-base.bin \
-  --host 127.0.0.1 --port 8081 --language auto --threads 4 \
+  --host 127.0.0.1 --port 8081 --language de --threads 4 \
   > /tmp/whisper.log 2>&1 &
 echo $! > /tmp/whisper.pid
 
