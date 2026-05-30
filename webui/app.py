@@ -2,7 +2,7 @@
 """Voice chat web UI.
 
 Serves a chat front-end that streams tokens from a local llama-server
-(OpenAI-compatible API) and speaks the response with Piper. Text is split
+(native /completion API) and speaks the response with Piper. Text is split
 into sentences as it streams so the first sentence is synthesized and played
 while the LLM is still generating the rest -> short time-to-first-audio.
 
@@ -26,7 +26,11 @@ from piper import PiperVoice
 # --- config ---------------------------------------------------------------
 HOST = "0.0.0.0"
 PORT = 5000
-LLAMA_URL = "http://127.0.0.1:8080/v1/chat/completions"
+LLAMA_BASE = "http://127.0.0.1:8080"
+# Native llama.cpp endpoints: /apply-template renders messages into a prompt
+# using the model's own (jinja) chat template; /completion streams the result.
+LLAMA_COMPLETION_URL = LLAMA_BASE + "/completion"
+LLAMA_TEMPLATE_URL = LLAMA_BASE + "/apply-template"
 WHISPER_URL = "http://127.0.0.1:8081/inference"
 WHISPER_LANGUAGE = "de"  # 'auto' to detect, or e.g. 'de' / 'en'
 VOICES_DIR = Path(__file__).resolve().parent.parent / "piper" / "voices"
@@ -99,19 +103,35 @@ def split_sentences(buffer: str, *, first: bool) -> tuple[list[str], str]:
     return sentences, buffer[pos:]
 
 
-def stream_llama(messages: list[dict]):
-    """Yield text deltas from llama-server's streaming chat endpoint."""
+def render_prompt(messages: list[dict]) -> str:
+    """Render messages into a raw prompt via the model's own chat template.
+
+    The native /completion endpoint takes a plain prompt string, so we let
+    llama-server apply its (jinja) chat template instead of hardcoding one.
+    """
     full_messages = []
     if SYSTEM_PROMPT:
         full_messages.append({"role": "system", "content": SYSTEM_PROMPT})
     full_messages.extend(messages)
+    payload = json.dumps({"messages": full_messages}).encode("utf-8")
+    req = urllib.request.Request(
+        LLAMA_TEMPLATE_URL, data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))["prompt"]
+
+
+def stream_llama(messages: list[dict]):
+    """Yield text deltas from llama-server's native /completion endpoint."""
     payload = json.dumps({
-        "messages": full_messages,
+        "prompt": render_prompt(messages),
         "stream": True,
         "temperature": 0.7,
+        "cache_prompt": True,
     }).encode("utf-8")
     req = urllib.request.Request(
-        LLAMA_URL, data=payload,
+        LLAMA_COMPLETION_URL, data=payload,
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req) as resp:
@@ -120,15 +140,15 @@ def stream_llama(messages: list[dict]):
             if not line.startswith("data:"):
                 continue
             data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
             try:
                 obj = json.loads(data)
-                delta = obj["choices"][0]["delta"].get("content", "")
-            except (json.JSONDecodeError, KeyError, IndexError):
+            except json.JSONDecodeError:
                 continue
+            delta = obj.get("content", "")
             if delta:
                 yield delta
+            if obj.get("stop"):
+                break
 
 
 def transcribe_wav(wav_bytes: bytes) -> str:
@@ -270,7 +290,7 @@ def main():
         scheme = "https"
 
     print(f"Voices: {', '.join(list_voices())}")
-    print(f"Serving on {scheme}://{HOST}:{PORT}  (llama-server expected at {LLAMA_URL})")
+    print(f"Serving on {scheme}://{HOST}:{PORT}  (llama-server expected at {LLAMA_COMPLETION_URL})")
     httpd.serve_forever()
 
 
