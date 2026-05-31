@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Voice chat web UI.
 
-Serves a chat front-end that streams tokens from a local llama-server
-(native /completion API) and speaks the response with Piper. Text is split
-into sentences as it streams so the first sentence is synthesized and played
-while the LLM is still generating the rest -> short time-to-first-audio.
+Serves a chat front-end that streams tokens from an in-process llama.cpp model
+(via the ``llama_chat`` package) and speaks the response with Piper. Text is
+split into sentences as it streams so the first sentence is synthesized and
+played while the LLM is still generating the rest -> short time-to-first-audio.
 
-Run with the piper venv:
+The ``llama_chat`` ChatWrapper keeps one KV cache alive across turns and prefills
+only new tokens; the chat template is auto-detected from the model.
+
+Run with the piper venv (with llama_chat importable, e.g. installed via
+llama/install.sh or on PYTHONPATH):
     piper/venv/bin/python webui/app.py
 """
 
@@ -23,14 +27,20 @@ from pathlib import Path
 
 from piper import PiperVoice
 
+from llama_chat import ChatWrapper, Config
+
 # --- config ---------------------------------------------------------------
 HOST = "0.0.0.0"
 PORT = 5000
-LLAMA_BASE = "http://127.0.0.1:8080"
-# Native llama.cpp endpoints: /apply-template renders messages into a prompt
-# using the model's own (jinja) chat template; /completion streams the result.
-LLAMA_COMPLETION_URL = LLAMA_BASE + "/completion"
-LLAMA_TEMPLATE_URL = LLAMA_BASE + "/apply-template"
+# The LLM runs in-process via the llama_chat package, so the KV cache persists
+# across turns and only new text is ever prefilled.
+MODEL_PATH = str(Path(__file__).resolve().parent.parent
+                 / "llama" / "models" / "gemma-4-E2B-it-Q4_K_M.gguf")
+CTX_SIZE = 4096       # hard context window; prefill + reply never exceed it
+N_THREADS = 4         # Raspberry Pi 5 has 4 cores
+# Evict old turns so the prefilled context stays under this fraction of
+# CTX_SIZE, leaving the rest for the reply. The system prompt is never evicted.
+HISTORY_BUDGET_PCT = 0.5
 WHISPER_URL = "http://127.0.0.1:8081/inference"
 WHISPER_LANGUAGE = "de"  # 'auto' to detect, or e.g. 'de' / 'en'
 VOICES_DIR = Path(__file__).resolve().parent.parent / "piper" / "voices"
@@ -103,52 +113,34 @@ def split_sentences(buffer: str, *, first: bool) -> tuple[list[str], str]:
     return sentences, buffer[pos:]
 
 
-def render_prompt(messages: list[dict]) -> str:
-    """Render messages into a raw prompt via the model's own chat template.
+# The persistent in-process chat wrapper (created in main()).
+chat: ChatWrapper | None = None
 
-    The native /completion endpoint takes a plain prompt string, so we let
-    llama-server apply its (jinja) chat template instead of hardcoding one.
-    """
-    full_messages = []
-    if SYSTEM_PROMPT:
-        full_messages.append({"role": "system", "content": SYSTEM_PROMPT})
-    full_messages.extend(messages)
-    payload = json.dumps({"messages": full_messages}).encode("utf-8")
-    req = urllib.request.Request(
-        LLAMA_TEMPLATE_URL, data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))["prompt"]
+
+def _has_history() -> bool:
+    """True if the wrapper holds any non-system (evictable) message."""
+    return any(m["role"] != "system" for m in chat.snapshot())
 
 
 def stream_llama(messages: list[dict]):
-    """Yield text deltas from llama-server's native /completion endpoint."""
-    payload = json.dumps({
-        "prompt": render_prompt(messages),
-        "stream": True,
-        "temperature": 0.7,
-        "cache_prompt": True,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        LLAMA_COMPLETION_URL, data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        for raw in resp:
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            try:
-                obj = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            delta = obj.get("content", "")
-            if delta:
-                yield delta
-            if obj.get("stop"):
-                break
+    """Yield reply text deltas for the latest user turn in ``messages``.
+
+    The wrapper owns the conversation and its KV cache, so only the new user
+    text is prefilled. The client still posts its full history each turn; we use
+    it only to resync the wrapper when a conversation is (re)started:
+
+    * a single message  -> a fresh conversation (page load / new chat): re-begin.
+    * wrapper has no history but the client sent prior turns -> the server was
+      restarted mid-conversation: replay the prior turns, then continue.
+    """
+    if not messages:
+        return
+    if len(messages) == 1:
+        chat.begin(SYSTEM_PROMPT)
+    elif not _has_history():
+        prior = [(m["role"], m["content"]) for m in messages[:-1]]
+        chat.begin(SYSTEM_PROMPT, prior)
+    yield from chat.stream(messages[-1]["content"])
 
 
 def transcribe_wav(wav_bytes: bytes) -> str:
@@ -279,6 +271,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global chat
+    print(f"Loading model: {MODEL_PATH}")
+    cfg = Config(
+        model_path=MODEL_PATH, n_ctx=CTX_SIZE, n_threads=N_THREADS,
+        threshold_pct=HISTORY_BUDGET_PCT)
+    chat = ChatWrapper(cfg)
+    chat.begin(SYSTEM_PROMPT)
+
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
 
     cert, key = CERT_DIR / "cert.pem", CERT_DIR / "key.pem"
@@ -290,7 +290,9 @@ def main():
         scheme = "https"
 
     print(f"Voices: {', '.join(list_voices())}")
-    print(f"Serving on {scheme}://{HOST}:{PORT}  (llama-server expected at {LLAMA_COMPLETION_URL})")
+    print(f"Serving on {scheme}://{HOST}:{PORT}")
+    print(f"Context: {CTX_SIZE} tokens, history budget {cfg.threshold_tokens} "
+          f"({int(HISTORY_BUDGET_PCT * 100)}%)")
     httpd.serve_forever()
 
 
