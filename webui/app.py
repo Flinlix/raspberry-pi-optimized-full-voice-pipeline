@@ -32,15 +32,6 @@ from llama_chat import ChatWrapper, Config, ContextOverflowError
 # --- config ---------------------------------------------------------------
 HOST = "0.0.0.0"
 PORT = 5000
-# The LLM runs in-process via the llama_chat package, so the KV cache persists
-# across turns and only new text is ever prefilled.
-MODEL_PATH = str(Path(__file__).resolve().parent.parent
-                 / "llama" / "models" / "gemma-4-E2B-it-Q4_K_M.gguf")
-CTX_SIZE = 4096       # hard context window; prefill + reply never exceed it
-N_THREADS = 4         # Raspberry Pi 5 has 4 cores
-# Evict old turns so the prefilled context stays under this fraction of
-# CTX_SIZE, leaving the rest for the reply. The system prompt is never evicted.
-HISTORY_BUDGET_PCT = 0.5
 WHISPER_URL = "http://127.0.0.1:8081/inference"
 WHISPER_LANGUAGE = "de"  # 'auto' to detect, or e.g. 'de' / 'en'
 VOICES_DIR = Path(__file__).resolve().parent.parent / "piper" / "voices"
@@ -113,8 +104,9 @@ def split_sentences(buffer: str, *, first: bool) -> tuple[list[str], str]:
     return sentences, buffer[pos:]
 
 
-# The persistent in-process chat wrapper (created in main()).
+# The persistent in-process chat wrapper and its config (created in main()).
 chat: ChatWrapper | None = None
+cfg: Config | None = None
 
 
 def _has_history() -> bool:
@@ -127,8 +119,8 @@ def cache_state() -> dict:
     return {
         "messages": chat.snapshot(),
         "total": chat.total_tokens,
-        "n_ctx": CTX_SIZE,
-        "threshold": int(HISTORY_BUDGET_PCT * CTX_SIZE),
+        "n_ctx": cfg.n_ctx,
+        "threshold": cfg.threshold_tokens,
     }
 
 
@@ -296,11 +288,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global chat
-    print(f"Loading model: {MODEL_PATH}")
-    cfg = Config(
-        model_path=MODEL_PATH, n_ctx=CTX_SIZE, n_threads=N_THREADS,
-        threshold_pct=HISTORY_BUDGET_PCT)
+    global chat, cfg
+    cfg = Config()
+    print(f"Loading model: {cfg.model_path}")
     chat = ChatWrapper(cfg)
     chat.begin(SYSTEM_PROMPT)
 
@@ -316,8 +306,8 @@ def main():
 
     print(f"Voices: {', '.join(list_voices())}")
     print(f"Serving on {scheme}://{HOST}:{PORT}")
-    print(f"Context: {CTX_SIZE} tokens, history budget {cfg.threshold_tokens} "
-          f"({int(HISTORY_BUDGET_PCT * 100)}%)")
+    print(f"Context: {cfg.n_ctx} tokens, history budget {cfg.threshold_tokens} "
+          f"({int(cfg.threshold_pct * 100)}%)")
     httpd.serve_forever()
 
 
