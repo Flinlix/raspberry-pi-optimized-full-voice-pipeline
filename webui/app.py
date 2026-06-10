@@ -122,6 +122,16 @@ def _has_history() -> bool:
     return any(m["role"] != "system" for m in chat.snapshot())
 
 
+def cache_state() -> dict:
+    """Current KV-cache layout for the inspector tab."""
+    return {
+        "messages": chat.snapshot(),
+        "total": chat.total_tokens,
+        "n_ctx": CTX_SIZE,
+        "threshold": int(HISTORY_BUDGET_PCT * CTX_SIZE),
+    }
+
+
 def stream_llama(messages: list[dict]):
     """Yield reply text deltas for the latest user turn in ``messages``.
 
@@ -140,7 +150,8 @@ def stream_llama(messages: list[dict]):
     elif not _has_history():
         prior = [(m["role"], m["content"]) for m in messages[:-1]]
         chat.begin(SYSTEM_PROMPT, prior)
-    yield from chat.stream(messages[-1]["content"])
+    # The generator's return value is the Turn summary (incl. n_evicted).
+    return (yield from chat.stream(messages[-1]["content"]))
 
 
 def transcribe_wav(wav_bytes: bytes) -> str:
@@ -192,6 +203,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, html, "text/html; charset=utf-8")
         elif self.path == "/voices":
             self._send(200, json.dumps(list_voices()).encode())
+        elif self.path == "/cache":
+            self._send(200, json.dumps(cache_state()).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -236,10 +249,14 @@ class Handler(BaseHTTPRequestHandler):
         first = True
         idx = 0
         stream = stream_llama(messages)
+        turn = None  # set to the Turn summary on normal (non-superseded) completion
         try:
-            for delta in stream:
-                if not is_current(gen_id):
-                    break  # superseded by a newer request
+            while is_current(gen_id):
+                try:
+                    delta = next(stream)
+                except StopIteration as done:
+                    turn = done.value
+                    break
                 self.wfile.write(sse("token", {"text": delta}))
                 self.wfile.flush()
                 buffer += delta
@@ -252,16 +269,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(sse("audio", {"i": idx, "wav": b64}))
                     self.wfile.flush()
                     idx += 1
-            else:
-                # loop finished without break: flush trailing text + done
+            # turn is set only if generation finished without being superseded.
+            if turn is not None and is_current(gen_id):
                 tail = buffer.strip()
-                if tail and is_current(gen_id):
+                if tail:
                     b64 = synth_wav_b64(voice, tail)
                     self.wfile.write(sse("audio", {"i": idx, "wav": b64}))
                     self.wfile.flush()
-                if is_current(gen_id):
-                    self.wfile.write(sse("done", {}))
+                if turn.n_evicted:
+                    self.wfile.write(sse("evicted", {"n": turn.n_evicted}))
                     self.wfile.flush()
+                self.wfile.write(sse("done", {}))
+                self.wfile.flush()
         except ContextOverflowError as e:
             try:
                 self.wfile.write(sse("error", {"message": str(e)}))

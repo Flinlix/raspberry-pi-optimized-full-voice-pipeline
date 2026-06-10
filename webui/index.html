@@ -23,12 +23,44 @@
     border-radius: 8px; padding: 6px 10px;
   }
   label.toggle { display: flex; gap: 6px; align-items: center; font-size: 14px; color: #9aa4b2; }
+  nav.tabs { display: flex; gap: 4px; padding: 8px 16px 0; background: #171a21; border-bottom: 1px solid #262b36; }
+  nav.tabs .tab {
+    background: none; color: #9aa4b2; border: none; border-bottom: 2px solid transparent;
+    padding: 8px 14px; cursor: pointer; font-size: 14px;
+  }
+  nav.tabs .tab.active { color: #e6e6e6; border-bottom-color: #2563eb; }
+  #chatView { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #cacheView { flex: 1; overflow-y: auto; padding: 16px; }
   #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
   .msg { max-width: 80%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .user { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 4px; }
   .bot { align-self: flex-start; background: #1d222c; border: 1px solid #2a303c; border-bottom-left-radius: 4px; }
   .bot.speaking { border-color: #3b82f6; }
   .bot.interrupted { opacity: 0.5; }
+  .notice { align-self: center; font-size: 12px; color: #9aa4b2; font-style: italic; }
+  /* KV cache view */
+  .cache-summary { font-size: 14px; color: #9aa4b2; margin-bottom: 12px; }
+  .cache-summary b { color: #e6e6e6; }
+  .cache-bar {
+    position: relative; display: flex; height: 28px; width: 100%;
+    background: #1d222c; border: 1px solid #2a303c; border-radius: 6px; overflow: hidden;
+  }
+  .cache-seg { height: 100%; }
+  .cache-seg.system { background: #6b7280; }
+  .cache-seg.user { background: #2563eb; }
+  .cache-seg.assistant { background: #10b981; }
+  .cache-thresh { position: absolute; top: -4px; bottom: -4px; width: 2px; background: #f59e0b; }
+  .cache-thresh::after {
+    content: 'threshold'; position: absolute; top: -16px; left: 4px;
+    font-size: 10px; color: #f59e0b; white-space: nowrap;
+  }
+  .cache-legend { display: flex; gap: 16px; margin: 10px 0 16px; font-size: 12px; color: #9aa4b2; }
+  .cache-legend span { display: flex; gap: 6px; align-items: center; }
+  .cache-legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  table.cache-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.cache-tbl th, table.cache-tbl td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #262b36; }
+  table.cache-tbl th { color: #9aa4b2; font-weight: 600; }
+  table.cache-tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
   footer { padding: 12px 16px; background: #171a21; border-top: 1px solid #262b36; display: flex; gap: 10px; }
   #input {
     flex: 1; background: #222732; color: #e6e6e6; border: 1px solid #333a47;
@@ -62,12 +94,19 @@
     </select>
     <button id="clear" style="margin-left:auto;background:#222732;color:#e6e6e6;border:1px solid #333a47;border-radius:8px;padding:6px 12px;cursor:pointer">clear</button>
   </header>
-  <div id="log"></div>
-  <footer>
-    <button id="mic" title="Microphone">🎤</button>
-    <textarea id="input" rows="1" placeholder="Type a message and press Enter…"></textarea>
-    <button id="send">Send</button>
-  </footer>
+  <nav class="tabs">
+    <button class="tab active" data-tab="chat">Chat</button>
+    <button class="tab" data-tab="cache">KV Cache</button>
+  </nav>
+  <div id="chatView">
+    <div id="log"></div>
+    <footer>
+      <button id="mic" title="Microphone">🎤</button>
+      <textarea id="input" rows="1" placeholder="Type a message and press Enter…"></textarea>
+      <button id="send">Send</button>
+    </footer>
+  </div>
+  <div id="cacheView" hidden></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -123,6 +162,14 @@ function addMsg(cls, text='') {
   return div;
 }
 
+function addNotice(text) {
+  const div = document.createElement('div');
+  div.className = 'notice';
+  div.textContent = '— ' + text + ' —';
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
 let controller = null;        // AbortController for the in-flight request
 let requestInFlight = false;  // true while a /chat request is streaming
 
@@ -172,10 +219,16 @@ async function send(textArg) {
           log.scrollTop = log.scrollHeight;
         } else if (ev[1] === 'audio') {
           enqueueAudio(payload.wav);
+        } else if (ev[1] === 'evicted') {
+          const n = payload.n;
+          addNotice(n + (n === 1 ? ' message' : ' messages') + ' evicted from context');
+        } else if (ev[1] === 'error') {
+          botDiv.textContent = full + '\n[' + payload.message + ']';
         }
       }
     }
     history.push({ role: 'assistant', content: full });
+    refreshCache();
   } catch (e) {
     if (e.name === 'AbortError') {
       botDiv.classList.add('interrupted');   // superseded; leave partial text
@@ -361,6 +414,55 @@ micModeSel.onchange = () => {
   pttHeld = false;
   micBtn.classList.remove('recording', 'listening', 'busy');
 };
+
+// ===== Tabs + KV cache view ============================================
+const chatView = $('#chatView'), cacheView = $('#cacheView');
+let cacheTabActive = false;
+
+document.querySelectorAll('nav.tabs .tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('nav.tabs .tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    cacheTabActive = tab.dataset.tab === 'cache';
+    chatView.hidden = cacheTabActive;
+    cacheView.hidden = !cacheTabActive;
+    if (cacheTabActive) refreshCache();
+  };
+});
+
+async function refreshCache() {
+  if (!cacheTabActive) return;   // only fetch when the tab is visible
+  try {
+    const r = await fetch('/cache');
+    renderCache(await r.json());
+  } catch (e) {
+    cacheView.textContent = 'Failed to load cache: ' + e.message;
+  }
+}
+
+function renderCache(d) {
+  const pct = n => (100 * n / d.n_ctx).toFixed(2) + '%';
+  const segs = d.messages.map(m =>
+    `<div class="cache-seg ${m.role}" style="width:${pct(m.n_tokens)}" `
+    + `title="${m.role}: ${m.n_tokens} tok (pos ${m.pos_start}–${m.pos_end})"></div>`
+  ).join('');
+  const rows = d.messages.map((m, i) =>
+    `<tr><td class="num">${i}</td><td>${m.role}</td>`
+    + `<td class="num">${m.n_tokens}</td><td class="num">${m.pos_start}–${m.pos_end}</td></tr>`
+  ).join('');
+  cacheView.innerHTML =
+    `<div class="cache-summary"><b>${d.total}</b> / ${d.n_ctx} tokens`
+    + ` · eviction threshold <b>${d.threshold}</b></div>`
+    + `<div class="cache-bar">${segs}`
+    + `<div class="cache-thresh" style="left:${pct(d.threshold)}"></div></div>`
+    + `<div class="cache-legend">`
+    + `<span><i style="background:#6b7280"></i>system</span>`
+    + `<span><i style="background:#2563eb"></i>user</span>`
+    + `<span><i style="background:#10b981"></i>assistant</span></div>`
+    + `<table class="cache-tbl"><thead><tr><th>#</th><th>role</th>`
+    + `<th class="num">tokens</th><th class="num">positions</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`;
+}
 
 loadVoices();
 input.focus();
