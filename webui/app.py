@@ -27,7 +27,7 @@ from pathlib import Path
 
 from piper import PiperVoice
 
-from llama_chat import ChatWrapper, Config
+from llama_chat import ChatWrapper, Config, ContextOverflowError
 
 # --- config ---------------------------------------------------------------
 HOST = "0.0.0.0"
@@ -262,6 +262,12 @@ class Handler(BaseHTTPRequestHandler):
                 if is_current(gen_id):
                     self.wfile.write(sse("done", {}))
                     self.wfile.flush()
+        except ContextOverflowError as e:
+            try:
+                self.wfile.write(sse("error", {"message": str(e)}))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
