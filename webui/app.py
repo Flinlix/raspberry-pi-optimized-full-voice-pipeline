@@ -119,7 +119,7 @@ def cache_state() -> dict:
     return {
         "messages": chat.snapshot(),
         "total": chat.total_tokens,
-        "n_ctx": cfg.n_ctx,
+        "n_ctx": cfg.context_size,
         "threshold": cfg.threshold_tokens,
     }
 
@@ -306,8 +306,8 @@ def main():
 
     print(f"Voices: {', '.join(list_voices())}")
     print(f"Serving on {scheme}://{HOST}:{PORT}")
-    print(f"Context: {cfg.n_ctx} tokens, history budget {cfg.threshold_tokens} "
-          f"({int(cfg.threshold_pct * 100)}%)")
+    print(f"Context: {cfg.context_size} tokens, history budget {cfg.threshold_tokens} "
+          f"({int(cfg.eviction_threshold * 100)}%)")
     httpd.serve_forever()
 
 
