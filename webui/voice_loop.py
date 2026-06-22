@@ -78,6 +78,12 @@ ASR_CHANNEL = 0                     # the DSP-processed channel to transcribe
 BUTTON_PIN = 17                     # BCM GPIO17 (pin 11); button to GND, pull-up
 BOUNCE_S = 0.05                     # debounce window for the mechanical button
 
+# Typed stdin lines are added to the conversation as context (no reply is
+# generated) via ChatWrapper.inject. Each line is injected with INJECT_ROLE
+# ("user", "assistant", or "system") and its content prefixed by INJECT_PREFIX.
+INJECT_ROLE = "system"
+INJECT_PREFIX = "Received sensor data: "
+
 FRAME_MS = 30                       # mic read granularity (also release polling)
 MAX_UTTERANCE_S = 15.0              # safety cap on a single utterance
 MIN_UTTERANCE_S = 0.3               # ignore taps shorter than this (pure interrupt)
@@ -291,6 +297,20 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
     print(f"  < {reply.strip()}")
 
 
+def stdin_inject_loop(chat: ChatWrapper) -> None:
+    """Inject each typed stdin line as conversation context (no reply)."""
+    for line in sys.stdin:                 # ends cleanly on EOF (e.g. no tty)
+        text = line.strip()
+        if not text:
+            continue
+        message = INJECT_PREFIX + text
+        try:
+            chat.inject(message, INJECT_ROLE)   # blocks if a turn is streaming
+            print(f"[inject] {INJECT_ROLE}: {message}")
+        except Exception as e:             # e.g. ValueError if it can't fit
+            print(f"[inject] error: {e}")
+
+
 def main():
     cfg = Config()
     print(f"Loading model: {cfg.model_path}")
@@ -323,9 +343,13 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
 
+    # Read typed lines from the terminal and inject them as context (no reply).
+    threading.Thread(target=stdin_inject_loop, args=(chat,), daemon=True).start()
+
     print(f"Voice: {VOICE}  |  Device: {ALSA_DEVICE}  |  Button: GPIO{BUTTON_PIN}")
     print("Push-to-talk: hold the button to talk, release for a reply.")
-    print("Press any time to interrupt and start a new turn. Ctrl-C to stop.")
+    print(f"Type a line to inject context as {INJECT_ROLE!r} (prefix {INJECT_PREFIX!r}).")
+    print("Press the button any time to interrupt and start a new turn. Ctrl-C to stop.")
     try:
         while True:
             # Idle until pressed; the 1 s timeout keeps Ctrl-C responsive.
