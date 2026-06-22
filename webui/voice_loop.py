@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Hands-free voice assistant on the Pi's ReSpeaker mic + speaker.
+"""Push-to-talk voice assistant on the Pi's ReSpeaker mic + speaker.
 
 Same pipeline as ``webui/app.py`` (whisper STT -> llama_chat LLM -> Piper TTS),
 but the browser's microphone and speaker are replaced by the local ReSpeaker
 4-Mic Array: ``arecord`` captures from the array and ``aplay`` plays back through
 the speaker on its 3.5 mm jack (both ALSA card 2 -> ``plughw:2,0``).
 
-The loop is hands-free and turn-based: it listens, auto-stops when you stop
-talking (simple RMS voice-activity detection), transcribes, streams a reply from
-the model, and speaks each sentence as soon as it is produced. It never records
-while speaking, so it does not transcribe its own output.
+Interaction is push-to-talk via a momentary button on a GPIO pin:
+
+* Hold the button to record; release to transcribe and get a spoken reply.
+* Pressing the button at any time interrupts whatever is happening - it stops
+  the model's generation and the speaker instantly - and immediately starts
+  recording the next utterance (so a held press both barges in and begins the
+  new turn). A quick tap during a reply just stops it and returns to idle.
+
+It never records while not pressed, so it cannot transcribe its own output.
 
 Requires whisper-server running on 127.0.0.1:8081 (see ``voice-start.sh``).
 
-Run with the piper venv and ``llama_chat`` importable (same as app.py):
-    PYTHONPATH=llama:<llama-site-packages> piper/venv/bin/python webui/voice_loop.py
+Run with the piper venv, ``llama_chat`` importable, and the system ``gpiozero``
+on the path (same as ``voice-start.sh``):
+    PYTHONPATH=llama:<llama-site>:/usr/lib/python3/dist-packages \
+        piper/venv/bin/python webui/voice_loop.py
 """
 
 import io
@@ -27,6 +34,8 @@ import threading
 import wave
 
 import numpy as np
+from gpiozero import Button, Device
+from gpiozero.pins.lgpio import LGPIOFactory
 
 from llama_chat import ChatWrapper, Config, ContextOverflowError
 
@@ -48,33 +57,85 @@ from app import (
 )
 
 # --- config ---------------------------------------------------------------
-ALSA_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"  # ReSpeaker array: mic + 3.5mm speaker.
-                                    # Addressed by stable card NAME, not index,
-                                    # since USB re-enumeration changes the number.
+ALSA_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"  # ReSpeaker array speaker (3.5mm jack).
+                                    # plughw resamples Piper's 22.05 kHz WAV to the
+                                    # device. Addressed by stable card NAME, not
+                                    # index, since USB re-enumeration changes it.
+CAPTURE_DEVICE = "hw:CARD=ArrayUAC10,DEV=0"  # capture the array's *native* streams
+                                    # (no plug layer) so the 6 channels reach us
+                                    # un-mixed; we then keep only the ASR channel.
 VOICE = "de_DE-kerstin-low"         # Piper voice (German female, low/fast)
-SAMPLE_RATE = 16000                 # 16 kHz mono S16_LE -> what whisper expects
+SAMPLE_RATE = 16000                 # 16 kHz S16_LE -> the array's native rate / what
+                                    # whisper expects
 
-FRAME_MS = 30                       # VAD analysis frame size
-SILENCE_HANG = 0.8                  # stop after this many seconds of silence
-START_FRAMES = 3                    # consecutive loud frames needed to start
-PREROLL_FRAMES = 5                  # frames kept before onset so we don't clip
+# The XVF3000 array's 6-channel firmware exposes: channel 0 = DSP-processed audio
+# (echo-cancel + beamform + noise-suppress + auto-gain) meant for ASR; channels
+# 1-4 = the raw mic capsules; channel 5 = the playback loopback reference. Feeding
+# whisper the processed channel alone is far cleaner than ALSA's downmix of all 6.
+CAPTURE_CHANNELS = 6                # native channel count of the 6-ch firmware
+ASR_CHANNEL = 0                     # the DSP-processed channel to transcribe
+
+BUTTON_PIN = 17                     # BCM GPIO17 (pin 11); button to GND, pull-up
+BOUNCE_S = 0.05                     # debounce window for the mechanical button
+
+FRAME_MS = 30                       # mic read granularity (also release polling)
 MAX_UTTERANCE_S = 15.0              # safety cap on a single utterance
-MIN_UTTERANCE_S = 0.3               # ignore blips shorter than this
+MIN_UTTERANCE_S = 0.3               # ignore taps shorter than this (pure interrupt)
 
-CALIBRATE_S = 0.5                   # ambient-noise sampling at startup
-NOISE_FACTOR = 3.0                  # speech threshold = noise_floor * this ...
-MIN_RMS = 250.0                     # ... but never below this absolute RMS
+# Noise filter (spectral subtraction + high-pass) applied to the ASR channel
+# before transcription. Channel 0 is already DSP-denoised, so this stays gentle.
+NOISE_WIN = 512                     # STFT window (32 ms @ 16 kHz)
+NOISE_HOP = 128                     # 75% overlap
+NOISE_HIGHPASS_HZ = 100.0           # attenuate everything below this
+NOISE_PCTL = 20.0                   # per-bin noise floor = this percentile over time
+NOISE_ALPHA = 1.5                   # noise over-subtraction factor (higher = stronger)
+NOISE_FLOOR = 0.12                  # keep at least this fraction of each bin (anti-artifact)
 # --------------------------------------------------------------------------
 
-FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 2 bytes/sample, mono
+# One read = one FRAME_MS slice across all captured channels (interleaved).
+CAPTURE_FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * CAPTURE_CHANNELS * 2
 
 
-def rms(pcm: bytes) -> float:
-    """Root-mean-square amplitude of a little-endian int16 PCM frame."""
-    if not pcm:
-        return 0.0
-    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(samples * samples)))
+def extract_asr_channel(raw: bytes) -> bytes:
+    """Deinterleave the captured frames and return only the ASR channel as PCM."""
+    samples = np.frombuffer(raw, dtype=np.int16)
+    n = (len(samples) // CAPTURE_CHANNELS) * CAPTURE_CHANNELS  # drop partial frame
+    return samples[:n].reshape(-1, CAPTURE_CHANNELS)[:, ASR_CHANNEL].tobytes()
+
+
+def denoise(pcm: bytes) -> bytes:
+    """Light spectral-subtraction denoise + high-pass on mono S16_LE PCM.
+
+    Estimates a per-frequency noise floor from the quiet parts of the clip and
+    subtracts it (with a spectral floor to avoid musical-noise artifacts), then
+    drops everything below ``NOISE_HIGHPASS_HZ``. Operates on the whole utterance,
+    so call it once on the full recording rather than per frame.
+    """
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    if len(x) < NOISE_WIN:
+        return pcm
+
+    win = np.hanning(NOISE_WIN).astype(np.float32)
+    n_frames = 1 + (len(x) - NOISE_WIN) // NOISE_HOP
+    idx = np.arange(NOISE_WIN)[None, :] + NOISE_HOP * np.arange(n_frames)[:, None]
+    frames = x[idx] * win                       # (n_frames, NOISE_WIN)
+    spec = np.fft.rfft(frames, axis=1)
+    mag, phase = np.abs(spec), np.angle(spec)
+
+    noise = np.percentile(mag, NOISE_PCTL, axis=0)          # per-bin noise floor
+    clean = np.maximum(mag - NOISE_ALPHA * noise[None, :], NOISE_FLOOR * mag)
+    clean[:, np.fft.rfftfreq(NOISE_WIN, 1.0 / SAMPLE_RATE) < NOISE_HIGHPASS_HZ] = 0.0
+
+    rec = np.fft.irfft(clean * np.exp(1j * phase), n=NOISE_WIN, axis=1).astype(np.float32) * win
+    out = np.zeros(NOISE_HOP * (n_frames - 1) + NOISE_WIN, dtype=np.float32)
+    wsum = np.zeros_like(out)
+    w2 = win * win
+    for i in range(n_frames):                   # overlap-add with window normalization
+        s = i * NOISE_HOP
+        out[s:s + NOISE_WIN] += rec[i]
+        wsum[s:s + NOISE_WIN] += w2
+    out = (out / np.maximum(wsum, 1e-6))[: len(x)]
+    return np.clip(out * 32768.0, -32768, 32767).astype(np.int16).tobytes()
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -97,21 +158,20 @@ def synth_wav_bytes(voice, text: str) -> bytes:
 
 
 class Recorder:
-    """Captures single utterances from the mic via RMS voice-activity detection.
+    """Captures one utterance from the mic for as long as the button is held.
 
     The ReSpeaker is a USB UAC1.0 device that cannot capture and play back at the
-    same time, so arecord is opened only while listening and fully released
+    same time, so arecord is opened only while recording and fully released
     before any playback - otherwise the device errors out ("No such device").
     """
 
     def __init__(self):
         self.proc: subprocess.Popen | None = None
-        self.threshold = self._calibrate()
 
     def _spawn(self) -> subprocess.Popen:
         return subprocess.Popen(
-            ["arecord", "-q", "-D", ALSA_DEVICE, "-t", "raw",
-             "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1"],
+            ["arecord", "-q", "-D", CAPTURE_DEVICE, "-t", "raw",
+             "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", str(CAPTURE_CHANNELS)],
             stdout=subprocess.PIPE,
         )
 
@@ -125,50 +185,21 @@ class Recorder:
             self.proc.kill()
         self.proc = None
 
-    def _calibrate(self) -> float:
-        """Sample ambient noise to set the speech threshold."""
-        self.proc = self._spawn()
-        try:
-            n = max(1, int(CALIBRATE_S * 1000 / FRAME_MS))
-            floor = max(rms(self.proc.stdout.read(FRAME_BYTES)) for _ in range(n))
-        finally:
-            self._stop()
-        thr = max(floor * NOISE_FACTOR, MIN_RMS)
-        print(f"[vad] noise floor ~{floor:.0f}, speech threshold {thr:.0f}")
-        return thr
-
-    def listen(self) -> bytes:
-        """Open the mic, block until an utterance is captured, release the mic."""
+    def record_while_pressed(self, button: Button) -> bytes:
+        """Capture while the button is held; return mono PCM of the ASR channel."""
         self.proc = self._spawn()
         read = self.proc.stdout.read
         try:
-            preroll: list[bytes] = []
-            loud_run = 0
-            # Wait for speech onset, keeping a short rolling pre-roll buffer.
-            while True:
-                frame = read(FRAME_BYTES)
-                if not frame:
-                    return b""  # arecord ended (shutdown)
-                preroll.append(frame)
-                if len(preroll) > PREROLL_FRAMES:
-                    preroll.pop(0)
-                loud_run = loud_run + 1 if rms(frame) >= self.threshold else 0
-                if loud_run >= START_FRAMES:
-                    break
-
-            frames = list(preroll)
-            silence_run = 0
+            frames: list[bytes] = []
             max_frames = int(MAX_UTTERANCE_S * 1000 / FRAME_MS)
-            hang_frames = int(SILENCE_HANG * 1000 / FRAME_MS)
-            while len(frames) < max_frames:
-                frame = read(FRAME_BYTES)
+            # is_pressed is polled once per ~30 ms frame, so release stops us
+            # within one frame.
+            while button.is_pressed and len(frames) < max_frames:
+                frame = read(CAPTURE_FRAME_BYTES)
                 if not frame:
-                    break
+                    break  # arecord ended (shutdown)
                 frames.append(frame)
-                silence_run = silence_run + 1 if rms(frame) < self.threshold else 0
-                if silence_run >= hang_frames:
-                    break
-            return b"".join(frames)
+            return denoise(extract_asr_channel(b"".join(frames)))
         finally:
             self._stop()  # release the device before playback
 
@@ -177,56 +208,86 @@ class Recorder:
 
 
 class Player:
-    """Plays WAV chunks through the speaker, in order, on a background thread."""
+    """Plays WAV chunks through the speaker, in order, on a background thread.
+
+    Each chunk is played by a killable ``aplay`` subprocess so ``stop`` can halt
+    playback instantly (barge-in) and discard anything still queued.
+    """
 
     def __init__(self):
         self.q: queue.Queue[bytes | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
         while True:
             wav = self.q.get()
-            try:
-                if wav is None:
-                    return
-                subprocess.run(
+            if wav is None:
+                return
+            with self._lock:
+                self._proc = subprocess.Popen(
                     ["aplay", "-q", "-D", ALSA_DEVICE],
-                    input=wav, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 )
-            finally:
-                self.q.task_done()
+            proc = self._proc
+            try:
+                proc.communicate(input=wav)  # blocks until played or killed
+            except (ValueError, OSError):
+                pass  # killed mid-play by stop()
+            with self._lock:
+                self._proc = None
 
     def play(self, wav: bytes):
         self.q.put(wav)
 
-    def drain(self):
-        """Block until every queued chunk has finished playing."""
-        self.q.join()
+    def stop(self):
+        """Halt current playback and drop anything queued (barge-in)."""
+        with self._lock:
+            while True:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    break
+            if self._proc is not None:
+                self._proc.kill()
 
     def close(self):
+        self.stop()
         self.q.put(None)
 
 
-def speak_reply(chat: ChatWrapper, voice, player: Player, text: str):
-    """Stream the model's reply for ``text`` and speak it sentence by sentence."""
+def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
+                interrupted: threading.Event):
+    """Stream the model's reply for ``text`` and speak it sentence by sentence.
+
+    Stops early if ``interrupted`` is set (the button was pressed): the stream is
+    closed so the wrapper records exactly the tokens that reached the cache, and
+    no further audio is queued.
+    """
     buffer = ""
     first = True
     reply = ""
     stream = chat.stream(text)
     try:
         for delta in stream:
+            if interrupted.is_set():
+                break
             reply += delta
             buffer += delta
             sentences, buffer = split_sentences(buffer, first=first)
             for s in sentences:
+                if interrupted.is_set():
+                    break
                 first = False
                 player.play(synth_wav_bytes(voice, s))
     finally:
         stream.close()
-    tail = buffer.strip()
-    if tail:
-        player.play(synth_wav_bytes(voice, tail))
+    if not interrupted.is_set():
+        tail = buffer.strip()
+        if tail:
+            player.play(synth_wav_bytes(voice, tail))
     print(f"  < {reply.strip()}")
 
 
@@ -239,23 +300,42 @@ def main():
 
     player = Player()
     recorder = Recorder()
+    interrupted = threading.Event()
 
-    # Ctrl-C: tear down arecord/aplay cleanly.
+    Device.pin_factory = LGPIOFactory()
+    button = Button(BUTTON_PIN, pull_up=True, bounce_time=BOUNCE_S)
+
+    # Any press barges in: stop the speaker and the model's generation. The same
+    # press then starts the next recording (if it's a hold) back in the loop.
+    def on_press():
+        interrupted.set()
+        player.stop()
+
+    button.when_pressed = on_press
+
+    # Ctrl-C: tear down arecord/aplay and release the GPIO line cleanly.
     def shutdown(*_):
         recorder.close()
         player.close()
+        button.close()
         print("\nStopped.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
 
-    print(f"Voice: {VOICE}  |  Device: {ALSA_DEVICE}")
-    print("Listening - speak to the ReSpeaker. Ctrl-C to stop.")
+    print(f"Voice: {VOICE}  |  Device: {ALSA_DEVICE}  |  Button: GPIO{BUTTON_PIN}")
+    print("Push-to-talk: hold the button to talk, release for a reply.")
+    print("Press any time to interrupt and start a new turn. Ctrl-C to stop.")
     try:
         while True:
-            pcm = recorder.listen()
+            # Idle until pressed; the 1 s timeout keeps Ctrl-C responsive.
+            while not button.wait_for_press(timeout=1.0):
+                pass
+            interrupted.clear()      # consume the press that woke us
+            player.stop()            # silence any leftover reply still playing
+            pcm = recorder.record_while_pressed(button)
             if len(pcm) < MIN_UTTERANCE_S * SAMPLE_RATE * 2:
-                continue  # too short to be speech
+                continue  # too short to be speech (e.g. a tap to just interrupt)
             try:
                 text = transcribe_wav(pcm_to_wav(pcm))
             except Exception as e:
@@ -265,14 +345,13 @@ def main():
                 continue
             print(f"  > {text}")
             try:
-                speak_reply(chat, voice, player, text)
+                speak_reply(chat, voice, player, text, interrupted)
             except ContextOverflowError as e:
                 print(f"[llm] {e}")
-            # Don't listen again until we've finished speaking (no self-hearing).
-            player.drain()
     finally:
         recorder.close()
         player.close()
+        button.close()
 
 
 if __name__ == "__main__":
