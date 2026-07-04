@@ -28,5 +28,5 @@ echo "whisper-server ready."
 # Run the push-to-talk voice loop in the foreground (Ctrl-C to stop).
 # The system dist-packages dir is added so the venv can import gpiozero/lgpio
 # (installed via apt; they can't be pip-built inside the venv).
-LLAMA_SITE=$(./llama/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
-PYTHONPATH="$PWD/llama:$LLAMA_SITE:/usr/lib/python3/dist-packages" ./piper/venv/bin/python webui/voice_loop.py
+LLAMA_SITE=$(./faster-llama-chat/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
+PYTHONPATH="$PWD/faster-llama-chat:$LLAMA_SITE:/usr/lib/python3/dist-packages" ./piper/venv/bin/python webui/voice_loop.py

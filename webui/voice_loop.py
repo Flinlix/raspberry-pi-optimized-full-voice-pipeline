@@ -20,7 +20,7 @@ Requires whisper-server running on 127.0.0.1:8081 (see ``voice-start.sh``).
 
 Run with the piper venv, ``llama_chat`` importable, and the system ``gpiozero``
 on the path (same as ``voice-start.sh``):
-    PYTHONPATH=llama:<llama-site>:/usr/lib/python3/dist-packages \
+    PYTHONPATH=faster-llama-chat:<llama-site>:/usr/lib/python3/dist-packages \
         piper/venv/bin/python webui/voice_loop.py
 """
 

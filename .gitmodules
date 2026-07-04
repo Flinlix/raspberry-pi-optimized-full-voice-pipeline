@@ -1,0 +1,4 @@
+[submodule "faster-llama-chat"]
+	path = faster-llama-chat
+	url = https://github.com/Flinlix/faster-llama-chat.git
+	branch = main

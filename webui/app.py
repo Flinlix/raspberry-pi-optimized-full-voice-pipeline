@@ -10,7 +10,7 @@ The ``llama_chat`` ChatWrapper keeps one KV cache alive across turns and prefill
 only new tokens; the chat template is auto-detected from the model.
 
 Run with the piper venv (with llama_chat importable, e.g. installed via
-llama/install.sh or on PYTHONPATH):
+faster-llama-chat/install.sh or on PYTHONPATH):
     piper/venv/bin/python webui/app.py
 """
 

@@ -26,8 +26,8 @@ done
 echo "whisper-server ready."
 
 echo "Starting web UI..."
-LLAMA_SITE=$(./llama/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
-PYTHONPATH="$PWD/llama:$LLAMA_SITE" ./piper/venv/bin/python webui/app.py > /tmp/webui.log 2>&1 &
+LLAMA_SITE=$(./faster-llama-chat/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
+PYTHONPATH="$PWD/faster-llama-chat:$LLAMA_SITE" ./piper/venv/bin/python webui/app.py > /tmp/webui.log 2>&1 &
 echo $! > /tmp/webui.pid
 
 # HTTPS if a cert is present (needed for microphone access from other devices).
