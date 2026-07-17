@@ -14,6 +14,10 @@ Interaction is push-to-talk via a momentary button on a GPIO pin:
   recording the next utterance (so a held press both barges in and begins the
   new turn). A quick tap during a reply just stops it and returns to idle.
 
+The LED ring mirrors the state: pulsing green while idle, pulsing blue while
+the button is held (recording), spinning green while transcribing/thinking,
+and steady green while the reply is read out.
+
 It never records while not pressed, so it cannot transcribe its own output.
 
 Requires whisper-server running on 127.0.0.1:8081 (see ``voice-start.sh``).
@@ -55,6 +59,7 @@ from app import (
     split_sentences,
     transcribe_wav,
 )
+from led_controller import LEDController
 
 # --- config ---------------------------------------------------------------
 ALSA_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"  # ReSpeaker array speaker (3.5mm jack).
@@ -231,6 +236,7 @@ class Player:
         while True:
             wav = self.q.get()
             if wav is None:
+                self.q.task_done()
                 return
             with self._lock:
                 self._proc = subprocess.Popen(
@@ -244,6 +250,7 @@ class Player:
                 pass  # killed mid-play by stop()
             with self._lock:
                 self._proc = None
+            self.q.task_done()
 
     def play(self, wav: bytes):
         self.q.put(wav)
@@ -256,8 +263,13 @@ class Player:
                     self.q.get_nowait()
                 except queue.Empty:
                     break
+                self.q.task_done()
             if self._proc is not None:
                 self._proc.kill()
+
+    def wait_done(self):
+        """Block until everything queued has been played (or dropped by stop)."""
+        self.q.join()
 
     def close(self):
         self.stop()
@@ -265,12 +277,15 @@ class Player:
 
 
 def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
-                interrupted: threading.Event):
+                interrupted: threading.Event, leds: LEDController):
     """Stream the model's reply for ``text`` and speak it sentence by sentence.
 
     Stops early if ``interrupted`` is set (the button was pressed): the stream is
     closed so the wrapper records exactly the tokens that reached the cache, and
     no further audio is queued.
+
+    When the first audio chunk is queued, ``leds`` switches from the processing
+    animation to a steady color for the read-out.
     """
     buffer = ""
     first = True
@@ -286,6 +301,9 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
             for s in sentences:
                 if interrupted.is_set():
                     break
+                if first:
+                    leds.stop_animation()  # thinking -> speaking
+                    leds.ring_on(leds.color_green())
                 first = False
                 player.play(synth_wav_bytes(voice, s))
     finally:
@@ -293,6 +311,9 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
     if not interrupted.is_set():
         tail = buffer.strip()
         if tail:
+            if first:
+                leds.stop_animation()
+                leds.ring_on(leds.color_green())
             player.play(synth_wav_bytes(voice, tail))
     print(f"  < {reply.strip()}")
 
@@ -320,6 +341,7 @@ def main():
 
     player = Player()
     recorder = Recorder()
+    leds = LEDController()
     interrupted = threading.Event()
 
     Device.pin_factory = LGPIOFactory()
@@ -337,6 +359,7 @@ def main():
     def shutdown(*_):
         recorder.close()
         player.close()
+        leds.cleanup()
         button.close()
         print("\nStopped.")
         sys.exit(0)
@@ -352,14 +375,17 @@ def main():
     print("Press the button any time to interrupt and start a new turn. Ctrl-C to stop.")
     try:
         while True:
+            leds.pulse_ring(leds.color_green(), duration=float("inf"))   # idle
             # Idle until pressed; the 1 s timeout keeps Ctrl-C responsive.
             while not button.wait_for_press(timeout=1.0):
                 pass
             interrupted.clear()      # consume the press that woke us
             player.stop()            # silence any leftover reply still playing
+            leds.pulse_ring(leds.color_blue())    # recording (button held)
             pcm = recorder.record_while_pressed(button)
             if len(pcm) < MIN_UTTERANCE_S * SAMPLE_RATE * 2:
                 continue  # too short to be speech (e.g. a tap to just interrupt)
+            leds.spin_ring(leds.color_green())    # transcribing/thinking
             try:
                 text = transcribe_wav(pcm_to_wav(pcm))
             except Exception as e:
@@ -369,12 +395,16 @@ def main():
                 continue
             print(f"  > {text}")
             try:
-                speak_reply(chat, voice, player, text, interrupted)
+                speak_reply(chat, voice, player, text, interrupted, leds)
             except ContextOverflowError as e:
                 print(f"[llm] {e}")
+            # Hold the steady color until the reply has been fully spoken (or
+            # stopped by a barge-in); then loop back to the idle pulse.
+            player.wait_done()
     finally:
         recorder.close()
         player.close()
+        leds.cleanup()
         button.close()
 
 
