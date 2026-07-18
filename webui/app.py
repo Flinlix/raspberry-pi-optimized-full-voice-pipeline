@@ -95,11 +95,13 @@ def split_sentences(buffer: str, *, first: bool) -> tuple[list[str], str]:
     sentences = []
     pos = 0
     min_len = FIRST_FLUSH_MIN if first else LATER_FLUSH_MIN
+    pending = ""  # sub-threshold chunks held to merge with the next one
     for m in _SENT_RE.finditer(buffer):
-        chunk = m.group(0)
-        if chunk.strip() and len(chunk.strip()) >= min_len:
-            sentences.append(chunk.strip())
+        pending += m.group(0)
+        if len(pending.strip()) >= min_len:
+            sentences.append(pending.strip())
             pos = m.end()
+            pending = ""
             min_len = LATER_FLUSH_MIN  # only the very first uses the low bound
     return sentences, buffer[pos:]
 
