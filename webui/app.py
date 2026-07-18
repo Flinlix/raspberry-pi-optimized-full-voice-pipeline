@@ -300,9 +300,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global chat, cfg
     cfg = Config()
-    print(f"Loading model: {cfg.model_path}")
+    print(f"[llm] loading model: {cfg.model_path} …", flush=True)
     chat = ChatWrapper(cfg)
     chat.begin(SYSTEM_PROMPT)
+    print("[llm] model ready.")
 
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
 

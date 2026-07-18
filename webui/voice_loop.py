@@ -375,9 +375,10 @@ def stdin_inject_loop(chat: ChatWrapper) -> None:
 
 def main():
     cfg = Config()
-    print(f"Loading model: {cfg.model_path}")
+    print(f"[llm] loading model: {cfg.model_path} …", flush=True)
     chat = ChatWrapper(cfg)
     chat.begin(SYSTEM_PROMPT)
+    print("[llm] model ready.")
     voice = get_voice(VOICE)
 
     player = Player()
