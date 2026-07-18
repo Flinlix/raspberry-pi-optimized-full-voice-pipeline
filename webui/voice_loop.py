@@ -34,6 +34,7 @@ import queue
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import wave
@@ -321,10 +322,18 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
             ("tts first sentence", tts_s),
         ]
         rows.append(("other", ttfa_s - sum(secs for _, secs in rows)))
-        rows.append(("ttfa (total)", ttfa_s))
-        print("[timing]")
+
+        bar_width = 20  # a full bar spans the total (ttfa)
+
+        def bar(secs: float) -> str:
+            blocks = round(secs / ttfa_s * bar_width) if ttfa_s > 0 else 0
+            return "█" * max(0, blocks)
+
+        print()
         for name, secs in rows:
-            print(f"  {name:<19} {secs:5.2f}s")
+            print(f"  {name:<19} {secs:5.2f}s  {bar(secs)}")
+        print("  " + "─" * (28 + bar_width))
+        print(f"  {'ttfa (total)':<19} {ttfa_s:5.2f}s  {'█' * bar_width}")
 
     try:
         for delta in stream:
@@ -356,7 +365,11 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
                 play_first(tail)
             else:
                 player.play(synth_wav_bytes(voice, tail))
-    print(f"  < {reply.strip()}")
+    body = reply.strip()
+    if body:
+        print()
+        print(textwrap.fill(body, width=72, initial_indent="< ",
+                            subsequent_indent="  "))
 
 
 def stdin_inject_loop(chat: ChatWrapper) -> None:
@@ -419,6 +432,7 @@ def main():
     ]
     width = max(len(s) for s in [title, *instructions])
     bar = "─" * (width + 2)
+    print()
     print(f"┌{bar}┐")
     print(f"│ {title:<{width}} │")
     print(f"├{bar}┤")
@@ -448,7 +462,7 @@ def main():
             stt_s = time.monotonic() - stt_start
             if not text:
                 continue
-            print(f"  > {text}")
+            print(f"\n> {text}")
             try:
                 speak_reply(chat, voice, player, text, interrupted, leds,
                             released_at, denoise_s, stt_s)
