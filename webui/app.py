@@ -17,15 +17,38 @@ faster-llama-chat/install.sh or on PYTHONPATH):
 import base64
 import io
 import json
+import os
 import re
 import ssl
 import threading
 import urllib.request
 import wave
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from piper import PiperVoice
+
+@contextmanager
+def _suppress_native_stderr():
+    """Silence C-level stderr for the duration of the block.
+
+    onnxruntime prints GPU-probe warnings straight to fd 2 at import time,
+    before any Python logging control can intercept them, so the only way to
+    keep them off the terminal is to redirect the file descriptor itself.
+    """
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
+with _suppress_native_stderr():
+    from piper import PiperVoice  # pulls in onnxruntime (noisy GPU probe)
 
 from llama_chat import ChatWrapper, Config, ContextOverflowError
 
@@ -300,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global chat, cfg
     cfg = Config()
-    print(f"[llm] loading model: {cfg.model_path} …", flush=True)
+    print(f"[llm] loading model: {cfg.model_path} ...", flush=True)
     chat = ChatWrapper(cfg)
     chat.begin(SYSTEM_PROMPT)
     print("[llm] model ready.")
@@ -315,9 +338,9 @@ def main():
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    print(f"Voices: {', '.join(list_voices())}")
-    print(f"Serving on {scheme}://{HOST}:{PORT}")
-    print(f"Context: {cfg.context_size} tokens, history budget {cfg.threshold_tokens} "
+    print(f"[tts] voices: {', '.join(list_voices())}")
+    print(f"[web] serving on {scheme}://{HOST}:{PORT}")
+    print(f"[llm] context: {cfg.context_size} tokens, history budget {cfg.threshold_tokens} "
           f"({int(cfg.eviction_threshold * 100)}%)")
     httpd.serve_forever()
 
