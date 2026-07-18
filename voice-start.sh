@@ -2,6 +2,9 @@
 set -e
 cd "$(dirname "$0")"
 
+# Wall-clock start, so voice_loop.py can report the full startup time.
+export VOICE_START_EPOCH=$(date +%s.%N)
+
 # Stop any existing instances first so we never collide on a port.
 ./voice-stop.sh > /dev/null 2>&1 || true
 sleep 1

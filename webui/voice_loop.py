@@ -30,6 +30,7 @@ on the path (same as ``voice-start.sh``):
 
 import io
 import logging
+import os
 import queue
 import signal
 import subprocess
@@ -386,6 +387,18 @@ def stdin_inject_loop(chat: ChatWrapper) -> None:
             print(f"[inject] error: {e}")
 
 
+def startup_elapsed_s() -> float | None:
+    """Seconds from the ``voice-start.sh`` launch to now, for the banner readout.
+
+    Uses the ``VOICE_START_EPOCH`` wall-clock stamp the script sets when it is
+    invoked, so the whole launch (whisper-server wait included) is counted.
+    Returns ``None`` when the var is absent - e.g. voice_loop.py run directly -
+    so the banner simply omits the readout.
+    """
+    started = os.environ.get("VOICE_START_EPOCH")
+    return time.time() - float(started) if started else None
+
+
 def main():
     cfg = Config()
     print(f"[llm] loading model: {cfg.model_path} ...", flush=True)
@@ -425,16 +438,20 @@ def main():
     threading.Thread(target=stdin_inject_loop, args=(chat,), daemon=True).start()
 
     title = "voice assistant"
+    elapsed = startup_elapsed_s()
+    status = f"ready in {elapsed:.1f}s" if elapsed is not None else ""
     instructions = [
         "hold the button to talk - press any time to interrupt",
         "type a line to inject context",
         "Ctrl-C to quit",
     ]
     width = max(len(s) for s in [title, *instructions])
+    if status:
+        width = max(width, len(title) + 2 + len(status))  # keep title + status on one line
     bar = "─" * (width + 2)
     print()
     print(f"┌{bar}┐")
-    print(f"│ {title:<{width}} │")
+    print(f"│ {title}{status:>{width - len(title)}} │")
     print(f"├{bar}┤")
     for line in instructions:
         print(f"│ {line:<{width}} │")
