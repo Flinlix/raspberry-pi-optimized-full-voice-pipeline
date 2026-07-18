@@ -148,9 +148,17 @@ def stream_llama(messages: list[dict]):
 
 def transcribe_wav(wav_bytes: bytes) -> str:
     """Forward WAV audio to whisper-server's /inference and return the text."""
+    with wave.open(io.BytesIO(wav_bytes)) as wav_file:
+        duration = wav_file.getnframes() / wav_file.getframerate()
+    # Whisper pads every clip to a 30 s window and runs its encoder over all
+    # 1500 context frames regardless of clip length. Shrinking audio_ctx to the
+    # clip's share (50 frames/s, plus headroom against truncated words) cuts
+    # encoder time roughly proportionally - the same trick whisper-stream uses.
+    audio_ctx = min(1500, int(duration * 50) + 128)
     boundary = "----webuiboundary"
     parts = []
-    for field, value in (("response_format", "json"), ("language", WHISPER_LANGUAGE)):
+    for field, value in (("response_format", "json"), ("language", WHISPER_LANGUAGE),
+                         ("audio_ctx", str(audio_ctx))):
         parts.append(f"--{boundary}\r\n".encode())
         parts.append(
             f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())

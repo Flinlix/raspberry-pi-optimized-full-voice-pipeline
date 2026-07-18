@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import wave
 
 import numpy as np
@@ -196,8 +197,13 @@ class Recorder:
             self.proc.kill()
         self.proc = None
 
-    def record_while_pressed(self, button: Button) -> bytes:
-        """Capture while the button is held; return mono PCM of the ASR channel."""
+    def record_while_pressed(self, button: Button) -> tuple[bytes, float]:
+        """Capture while the button is held.
+
+        Returns:
+            Mono PCM of the ASR channel, and the ``time.monotonic()`` instant of
+            the button release (the reference point for response-delay timing).
+        """
         self.proc = self._spawn()
         read = self.proc.stdout.read
         try:
@@ -210,7 +216,8 @@ class Recorder:
                 if not frame:
                     break  # arecord ended (shutdown)
                 frames.append(frame)
-            return denoise(extract_asr_channel(b"".join(frames)))
+            released_at = time.monotonic()
+            return denoise(extract_asr_channel(b"".join(frames))), released_at
         finally:
             self._stop()  # release the device before playback
 
@@ -277,7 +284,8 @@ class Player:
 
 
 def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
-                interrupted: threading.Event, leds: LEDController):
+                interrupted: threading.Event, leds: LEDController,
+                released_at: float, denoise_s: float, stt_s: float):
     """Stream the model's reply for ``text`` and speak it sentence by sentence.
 
     Stops early if ``interrupted`` is set (the button was pressed): the stream is
@@ -285,16 +293,45 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
     no further audio is queued.
 
     When the first audio chunk is queued, ``leds`` switches from the processing
-    animation to a steady color for the read-out.
+    animation to a steady color for the read-out, and a ``[timing]`` table is
+    printed breaking down TTFA - the total delay from the button release at
+    ``released_at`` until the first audio chunk is handed to the player - into
+    ``denoise_s`` (denoise + mic close), ``stt_s`` (whisper), the LLM's delay to
+    its first token, the first sentence's TTS synthesis, and the unaccounted
+    remainder (sentence splitting, WAV wrapping, ...).
     """
     buffer = ""
     first = True
     reply = ""
+    llm_start = time.monotonic()
+    first_token_s = 0.0
     stream = chat.stream(text)
+
+    def play_first(sentence: str):
+        """Synthesize + queue the first chunk, then print the timing table."""
+        tts_start = time.monotonic()
+        wav = synth_wav_bytes(voice, sentence)
+        tts_s = time.monotonic() - tts_start
+        player.play(wav)
+        ttfa_s = time.monotonic() - released_at
+        rows = [
+            ("denoise + mic close", denoise_s),
+            ("whisper", stt_s),
+            ("llm first token", first_token_s),
+            ("tts first sentence", tts_s),
+        ]
+        rows.append(("other", ttfa_s - sum(secs for _, secs in rows)))
+        rows.append(("ttfa (total)", ttfa_s))
+        print("[timing]")
+        for name, secs in rows:
+            print(f"  {name:<19} {secs:5.2f}s")
+
     try:
         for delta in stream:
             if interrupted.is_set():
                 break
+            if not reply:
+                first_token_s = time.monotonic() - llm_start
             reply += delta
             buffer += delta
             sentences, buffer = split_sentences(buffer, first=first)
@@ -304,8 +341,10 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
                 if first:
                     leds.stop_animation()  # thinking -> speaking
                     leds.ring_on(leds.color_green())
+                    play_first(s)
+                else:
+                    player.play(synth_wav_bytes(voice, s))
                 first = False
-                player.play(synth_wav_bytes(voice, s))
     finally:
         stream.close()
     if not interrupted.is_set():
@@ -314,7 +353,9 @@ def speak_reply(chat: ChatWrapper, voice, player: Player, text: str,
             if first:
                 leds.stop_animation()
                 leds.ring_on(leds.color_green())
-            player.play(synth_wav_bytes(voice, tail))
+                play_first(tail)
+            else:
+                player.play(synth_wav_bytes(voice, tail))
     print(f"  < {reply.strip()}")
 
 
@@ -382,20 +423,24 @@ def main():
             interrupted.clear()      # consume the press that woke us
             player.stop()            # silence any leftover reply still playing
             leds.pulse_ring(leds.color_blue())    # recording (button held)
-            pcm = recorder.record_while_pressed(button)
+            pcm, released_at = recorder.record_while_pressed(button)
+            denoise_s = time.monotonic() - released_at
             if len(pcm) < MIN_UTTERANCE_S * SAMPLE_RATE * 2:
                 continue  # too short to be speech (e.g. a tap to just interrupt)
             leds.spin_ring(leds.color_green())    # transcribing/thinking
+            stt_start = time.monotonic()
             try:
                 text = transcribe_wav(pcm_to_wav(pcm))
             except Exception as e:
                 print(f"[stt] error: {e}")
                 continue
+            stt_s = time.monotonic() - stt_start
             if not text:
                 continue
             print(f"  > {text}")
             try:
-                speak_reply(chat, voice, player, text, interrupted, leds)
+                speak_reply(chat, voice, player, text, interrupted, leds,
+                            released_at, denoise_s, stt_s)
             except ContextOverflowError as e:
                 print(f"[llm] {e}")
             # Hold the steady color until the reply has been fully spoken (or
