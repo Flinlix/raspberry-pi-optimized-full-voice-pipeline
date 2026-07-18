@@ -42,7 +42,7 @@ CERT_DIR = WEB_DIR / "certs"  # if cert.pem + key.pem exist here, serve HTTPS
 # longer for more natural prosody (quality).
 FIRST_FLUSH_MIN = 12
 LATER_FLUSH_MIN = 30
-SYSTEM_PROMPT = "Du bist ein Baum. Antworte stets in kurzen bis mittleren Sätzen auf Deutsch. Antworte nur in Fließtext. Antworte Faktenbasiert."  # e.g. "You are a helpful assistant. Always respond in complete sentences in German."
+SYSTEM_PROMPT = "Du bist ein Baum. Antworte immer freundlich, faktenbasiert und nur in Fließtext."  # e.g. "You are a helpful assistant. Always respond in complete sentences in German."
 # --------------------------------------------------------------------------
 
 _voice_cache: dict[str, PiperVoice] = {}
