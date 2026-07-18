@@ -411,10 +411,20 @@ def main():
     # Read typed lines from the terminal and inject them as context (no reply).
     threading.Thread(target=stdin_inject_loop, args=(chat,), daemon=True).start()
 
-    print(f"Voice: {VOICE}  |  Device: {ALSA_DEVICE}  |  Button: GPIO{BUTTON_PIN}")
-    print("Push-to-talk: hold the button to talk, release for a reply.")
-    print(f"Type a line to inject context as {INJECT_ROLE!r} (prefix {INJECT_PREFIX!r}).")
-    print("Press the button any time to interrupt and start a new turn. Ctrl-C to stop.")
+    title = "voice assistant"
+    instructions = [
+        "hold the button to talk - press any time to interrupt",
+        "type a line to inject context",
+        "Ctrl-C to quit",
+    ]
+    width = max(len(s) for s in [title, *instructions])
+    bar = "─" * (width + 2)
+    print(f"┌{bar}┐")
+    print(f"│ {title:<{width}} │")
+    print(f"├{bar}┤")
+    for line in instructions:
+        print(f"│ {line:<{width}} │")
+    print(f"└{bar}┘")
     try:
         while True:
             leds.pulse_ring(leds.color_green(), duration=float("inf"))   # idle
